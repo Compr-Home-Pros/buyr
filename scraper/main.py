@@ -20,6 +20,7 @@ from address_parser import parse_address
 from counties.registry import get_scraper
 from opencorporates.client import lookup_company
 from skiptracing.orchestrator import get_contacts
+from clozr import push_buyer_prospects
 
 app = FastAPI(title="Buyr Scraper API")
 
@@ -65,7 +66,9 @@ async def pipeline(req: SearchRequest):
     try:
         # ── Step 1: Parse address ──────────────────────────────────────────
         await _update(sid, "parsing_address", 8)
-        county, state = await parse_address(req.address, settings.google_maps_api_key)
+        api_keys = await _get_api_keys(req.user_id)
+        maps_key = settings.google_maps_api_key or api_keys.get("google_maps_api_key") or ""
+        county, state = await parse_address(req.address, maps_key)
         await _update(sid, "parsing_address", 15, parsed_county=county, parsed_state=state)
 
         # ── Step 2: Get wholesalers for this state ─────────────────────────
@@ -74,9 +77,6 @@ async def pipeline(req: SearchRequest):
         if not wholesalers:
             await _update(sid, "error", 20, error=f"No wholesalers found for state {state}")
             return
-
-        # ── Step 3: Get user API keys ──────────────────────────────────────
-        api_keys = await _get_api_keys(req.user_id)
 
         # ── Step 4: Scrape county deed records ─────────────────────────────
         await _update(sid, "searching_county_records", 30)
@@ -177,6 +177,15 @@ async def pipeline(req: SearchRequest):
             buyer["transactions"] = txn_by_buyer.get(buyer["name"].upper(), [])[:20]
 
         # ── Done ───────────────────────────────────────────────────────────
+        filed = await push_buyer_prospects(
+            settings.clozr_ingest_url,
+            settings.clozr_ingest_key,
+            sid,
+            enriched,
+            req.address,
+        )
+        if filed:
+            logger.info("Filed %s buyer prospects in CLOZR for search %s", filed, sid)
         await _update(sid, "complete", 100, results=enriched)
 
     except Exception as exc:
@@ -253,16 +262,25 @@ async def _get_wholesalers(state: str) -> list[str]:
 
 
 async def _get_api_keys(user_id: str) -> dict:
-    if not user_id:
+    """Settings saves the shared team row. Per-user keys only exist when auth is on."""
+    try:
+        if user_id:
+            resp = (
+                supabase.table("user_api_keys")
+                .select("*")
+                .eq("user_id", user_id)
+                .limit(1)
+                .execute()
+            )
+            rows = resp.data or []
+            if rows:
+                return rows[0]
+        resp = supabase.table("team_api_keys").select("*").eq("id", "team").limit(1).execute()
+        rows = resp.data or []
+        return rows[0] if rows else {}
+    except Exception as exc:
+        logger.warning("API key lookup failed: %s", exc)
         return {}
-    resp = (
-        supabase.table("user_api_keys")
-        .select("*")
-        .eq("user_id", user_id)
-        .single()
-        .execute()
-    )
-    return resp.data or {}
 
 
 async def _update(
